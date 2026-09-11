@@ -238,6 +238,11 @@ struct MatrixOut {
     nnz: u64,
     /// Byte offset of the fixed-width `nnz` field within the size line.
     nnz_offset: u64,
+    /// Largest 1-based row index actually emitted (0 if none). Used at
+    /// finalization to restore the coordinate bounds check that
+    /// `sprs::TriMatI::add_triplet` performed before streaming replaced it:
+    /// no entry may reference a row beyond the declared row count.
+    max_row_plus_one: usize,
 }
 
 /// Width of the blank `nnz` field reserved in the size line. u64::MAX is 20
@@ -1322,6 +1327,10 @@ where
                         .write_all(mtx_line_buf.as_bytes())
                         .expect("can't write to matrix file");
                     mo.nnz += cell_nnz;
+                    // Track the largest emitted row so finalization can reject a
+                    // matrix that references a row beyond its declared row count
+                    // (the guarantee TriMat::add_triplet used to provide).
+                    mo.max_row_plus_one = mo.max_row_plus_one.max(row_index + 1);
                 }
 
                 // Record bootstrap summary stats (mean/var) as sparse triplets
@@ -1355,7 +1364,7 @@ where
                         }
                     }
                     if !found {
-                        geqmap.global_eqc.insert(labels.to_vec().clone(), next_id);
+                        geqmap.global_eqc.insert(labels.to_vec(), next_id);
                         next_id += 1;
                     }
                 }
@@ -1674,14 +1683,6 @@ where
     let empty_resolved_cells = Arc::new(Mutex::new(Vec::<u64>::new()));
     let tiny_cell_resolved_cells = Arc::new(Mutex::new(Vec::<u64>::new()));
 
-    // Estimate initial triplet capacity for MTX output. The 10% density assumption
-    // is far too high for large multiplexed datasets (actual density is often <0.5%).
-    // Cap at 256M entries (~3GB) to avoid overallocation; the vec will grow as needed.
-    let _tmcap = {
-        let estimate = (0.1f64 * num_genes as f64 * num_cells as f64).round() as usize;
-        estimate.min(256_000_000)
-    };
-
     // the length of the vector of gene counts we'll use
     let num_rows = if usa_mode {
         // the number of genes should be the max gene id + 1
@@ -1723,7 +1724,10 @@ where
     // verbatim so the header matches the previous sprs-produced output.
     let matrix_out = {
         let mtx_path = output_matrix_path.join("quants_mat.mtx");
-        let mut writer = BufWriter::new(File::create(&mtx_path)?);
+        // Explicit 256 KiB buffer: a large per-cell payload would bypass the
+        // 8 KiB default and force ~one write syscall per cell; 256 KiB keeps
+        // syscall frequency low without retaining the whole matrix.
+        let mut writer = BufWriter::with_capacity(256 * 1024, File::create(&mtx_path)?);
         let banner = "%%MatrixMarket matrix coordinate real general\n% written by sprs\n";
         writer.write_all(banner.as_bytes())?;
         let size_prefix = format!("{} {} ", num_cells as usize, num_rows);
@@ -1735,6 +1739,7 @@ where
             writer,
             nnz: 0,
             nnz_offset,
+            max_row_plus_one: 0,
         }))
     };
 
@@ -1919,18 +1924,38 @@ where
     // when the threads joined above, so this is the sole remaining handle.
     let total_nnz = {
         let mut mo = matrix_out.lock().unwrap();
+        // Coordinate bounds validation, restoring the guarantee that
+        // `sprs::TriMatI::add_triplet` provided before streaming replaced it:
+        // refuse to finalize a matrix that references a row beyond the declared
+        // row count. This catches inconsistent filter/dimension sizing (for
+        // example a single cell barcode shared across two samples), which would
+        // otherwise return `Ok` with a `quants_mat.mtx` a MatrixMarket reader
+        // rejects at load time with "row indices should be within shape".
+        if mo.max_row_plus_one > num_cells as usize {
+            anyhow::bail!(
+                "streamed count matrix references row {} but only {} rows were \
+                 declared (num_cells); filter/dimension sizing is inconsistent. \
+                 Refusing to write an out-of-bounds MatrixMarket matrix.",
+                mo.max_row_plus_one,
+                num_cells
+            );
+        }
+        // Flush the streamed body, then patch the reserved `nnz` field. Seeking,
+        // formatting, and the final flush all go THROUGH the BufWriter (not the
+        // raw File) so the fixed-width field is emitted as a single buffered
+        // write, rather than one File::write for the digits plus one per padding
+        // space.
         mo.writer.flush()?;
         let nnz = mo.nnz;
         let offset = mo.nnz_offset;
-        let f = mo.writer.get_mut();
-        f.seek(SeekFrom::Start(offset))?;
+        mo.writer.seek(SeekFrom::Start(offset))?;
         // Left-justify within the reserved fixed-width field: the value hugs the
         // single space after `cols`, and the remaining bytes are trailing spaces
         // before the newline. The size line therefore reads as three
         // single-space-separated integers plus harmless trailing whitespace,
         // which every MatrixMarket reader (scipy/scanpy/af-anndata) tolerates.
-        write!(f, "{:<width$}", nnz, width = MTX_NNZ_FIELD_WIDTH)?;
-        f.flush()?;
+        write!(mo.writer, "{:<width$}", nnz, width = MTX_NNZ_FIELD_WIDTH)?;
+        mo.writer.flush()?;
         nnz
     };
     info!(
